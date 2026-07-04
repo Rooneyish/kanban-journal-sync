@@ -4,6 +4,7 @@ import json
 import requests
 import time
 import logging
+import subprocess
 from datetime import date
 from simple_term_menu import TerminalMenu
 
@@ -13,11 +14,68 @@ KANBAN_STATE = os.path.expanduser("~/.kanban_state.json")
 LOG_FILE = os.path.expanduser("~/.kanban_debug.log")
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
+QUEUE_REPO = os.path.expanduser("~/journal-queue")
+QUEUE_FILE = os.path.join(QUEUE_REPO, "queue.json")
+SYNCED_IDS_FILE = os.path.expanduser("~/.journal_queue_synced_ids.json")
+
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
+def pull_and_merge_queue():
+    """Pull the remote journal-queue repo and merge any new entries
+    into the local journal DB, deduping by entry id."""
+    if not os.path.exists(QUEUE_REPO):
+        logging.debug("Queue repo not found at %s -- skipping remote sync", QUEUE_REPO)
+        return
+
+    try:
+        subprocess.run(
+            ["git", "pull"],
+            cwd=QUEUE_REPO, check=True, capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        logging.error("git pull failed for queue repo: %s", e)
+        return
+
+    if not os.path.exists(QUEUE_FILE):
+        logging.debug("No queue.json found yet in %s", QUEUE_REPO)
+        return
+
+    with open(QUEUE_FILE, "r") as f:
+        queue_data = json.load(f)
+
+    if os.path.exists(SYNCED_IDS_FILE):
+        with open(SYNCED_IDS_FILE, "r") as f:
+            synced_ids = set(json.load(f))
+    else:
+        synced_ids = set()
+
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
+            db = json.load(f)
+    else:
+        db = {}
+
+    new_count = 0
+    for date_key, entries in queue_data.items():
+        for entry in entries:
+            entry_id = entry.get("id")
+            if entry_id is None or entry_id in synced_ids:
+                continue
+            db.setdefault(date_key, []).append({"content": entry["content"]})
+            synced_ids.add(entry_id)
+            new_count += 1
+
+    if new_count:
+        with open(DB_FILE, "w") as f:
+            json.dump(db, f, indent=2)
+        with open(SYNCED_IDS_FILE, "w") as f:
+            json.dump(list(synced_ids), f)
+        logging.debug("Merged %d new entries from remote queue", new_count)
+
 
 def load_state():
     if os.path.exists(KANBAN_STATE):
@@ -110,6 +168,7 @@ def get_tasks_from_journal():
     return tasks, latest_date, entry_count, success
 
 def launch_kanban_ui():
+    pull_and_merge_queue()
     state = load_state()
     state.setdefault("_last_processed_date", None)
 
